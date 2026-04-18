@@ -86,8 +86,6 @@ def aggregate(raw: dict, days: list[date]) -> dict:
         m = {it["day"]: it.get(field) for it in items if "day" in it}
         return [m.get(k) for k in keys]
 
-    sleep_score = by_day(raw["daily_sleep"], "score")
-
     # Pick the longest sleep session per day (filter out naps)
     longest: dict[str, dict] = {}
     for s in raw["sleep"]:
@@ -102,10 +100,16 @@ def aggregate(raw: dict, days: list[date]) -> dict:
     light = [(longest.get(k, {}).get("light_sleep_duration") or 0) / 3600 for k in keys]
     total_sleep_hr = [d + r + l for d, r, l in zip(deep, rem, light)]
     resting_hr = [longest.get(k, {}).get("lowest_heart_rate") for k in keys]
+    sleep_efficiency = [longest.get(k, {}).get("efficiency") for k in keys]
 
-    activity_score = by_day(raw["daily_activity"], "score")
-    steps          = by_day(raw["daily_activity"], "steps")
-    calories       = by_day(raw["daily_activity"], "active_calories")
+    steps    = by_day(raw["daily_activity"], "steps")
+    calories = by_day(raw["daily_activity"], "active_calories")
+
+    def _sec_to_min(xs):
+        return [(v / 60) if v is not None else None for v in xs]
+
+    high_activity_min   = _sec_to_min(by_day(raw["daily_activity"], "high_activity_time"))
+    medium_activity_min = _sec_to_min(by_day(raw["daily_activity"], "medium_activity_time"))
 
     stress_min = [
         (v / 60) if v is not None else None
@@ -115,13 +119,14 @@ def aggregate(raw: dict, days: list[date]) -> dict:
     return {
         "labels": [d.strftime("%a") for d in days],
         "sub_labels": [d.strftime("%-m/%-d") for d in days],
-        "sleep_score": sleep_score,
+        "sleep_efficiency": sleep_efficiency,
         "deep": deep,
         "rem": rem,
         "light": light,
         "total_sleep_hr": total_sleep_hr,
         "resting_hr": resting_hr,
-        "activity_score": activity_score,
+        "high_activity_min": high_activity_min,
+        "medium_activity_min": medium_activity_min,
         "steps": steps,
         "calories": calories,
         "stress_min": stress_min,
@@ -228,8 +233,8 @@ def _bar_chart(agg, key, title, color, fmt="{:.0f}"):
     return _to_png(fig)
 
 
-def render_sleep_score(agg) -> bytes:
-    return _line_chart(agg, "sleep_score", "Sleep Score", INDIGO, ymax=100)
+def render_sleep_efficiency(agg) -> bytes:
+    return _line_chart(agg, "sleep_efficiency", "Sleep Efficiency (%)", INDIGO, ymax=100, suffix="%")
 
 
 def render_sleep_stages(agg) -> bytes:
@@ -255,8 +260,25 @@ def render_sleep_stages(agg) -> bytes:
     return _to_png(fig)
 
 
-def render_activity_score(agg) -> bytes:
-    return _line_chart(agg, "activity_score", "Activity Score", ORANGE, ymax=100)
+def render_activity_minutes(agg) -> bytes:
+    fig, ax = plt.subplots(figsize=(10, 3.8))
+    x = list(range(len(agg["labels"])))
+    high = [v or 0 for v in agg["high_activity_min"]]
+    med  = [v or 0 for v in agg["medium_activity_min"]]
+    ax.bar(x, high, color=ORANGE, width=0.55, label="High intensity", zorder=3)
+    ax.bar(x, med,  bottom=high, color=AMBER, width=0.55, label="Moderate intensity", zorder=3)
+    totals = [h + m for h, m in zip(high, med)]
+    for xi, t in zip(x, totals):
+        if t > 0:
+            ax.annotate(f"{t:.0f}m", (xi, t), textcoords="offset points",
+                        xytext=(0, 6), ha="center", fontsize=11,
+                        fontweight="bold", color=SLATE_TEXT)
+    ax.set_title("Active Minutes")
+    ax.set_xticks(x); ax.set_xticklabels(_x_labels(agg))
+    ax.legend(loc="upper right", frameon=False, fontsize=10, labelcolor=SLATE_MUTED, ncols=2)
+    cur_top = max(totals, default=0)
+    ax.set_ylim(0, cur_top * 1.30 if cur_top else 1)
+    return _to_png(fig)
 
 
 def render_steps(agg) -> bytes:
@@ -325,9 +347,12 @@ def _section_header(title: str, subtitle: str) -> str:
 
 
 def build_html(agg: dict, start: date, end: date) -> str:
-    avg_sleep = _safe_avg(agg["sleep_score"])
+    avg_efficiency = _safe_avg(agg["sleep_efficiency"])
     avg_sleep_dur = _safe_avg(agg["total_sleep_hr"])
-    avg_act = _safe_avg(agg["activity_score"])
+    avg_active_min = _safe_avg([
+        (h or 0) + (m or 0)
+        for h, m in zip(agg["high_activity_min"], agg["medium_activity_min"])
+    ])
     total_steps = _safe_sum(agg["steps"])
     total_cal = _safe_sum(agg["calories"])
     avg_rhr = _safe_avg(agg["resting_hr"])
@@ -342,11 +367,11 @@ def build_html(agg: dict, start: date, end: date) -> str:
     cards_html = f"""
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:6px;">
       <tr>
-        {_stat_card("Sleep Score", fmt(avg_sleep), "weekly avg", INDIGO)}
+        {_stat_card("Sleep Efficiency", fmt(avg_efficiency, "%"), "weekly avg", INDIGO)}
         {_stat_card("Sleep Duration", fmt(avg_sleep_dur, " h"), "weekly avg", INDIGO)}
       </tr>
       <tr>
-        {_stat_card("Activity Score", fmt(avg_act), "weekly avg", ORANGE)}
+        {_stat_card("Active Min / Day", fmt(avg_active_min, " min"), "high + moderate", ORANGE)}
         {_stat_card("Total Steps", fmt(total_steps), "this week", ORANGE)}
       </tr>
       <tr>
@@ -378,7 +403,7 @@ def build_html(agg: dict, start: date, end: date) -> str:
       {_section_header("Sleep", "How well and how long you rested")}
       <tr><td>
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-          {_chart_card("sleep_score")}
+          {_chart_card("sleep_efficiency")}
           {_chart_card("sleep_stages")}
         </table>
       </td></tr>
@@ -387,7 +412,7 @@ def build_html(agg: dict, start: date, end: date) -> str:
       {_section_header("Activity", "Movement and energy expenditure")}
       <tr><td>
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-          {_chart_card("activity_score")}
+          {_chart_card("activity_minutes")}
           {_chart_card("steps")}
           {_chart_card("calories")}
         </table>
@@ -456,13 +481,13 @@ def main() -> None:
     print("Rendering charts...")
     _setup_style()
     images = {
-        "sleep_score":  render_sleep_score(agg),
-        "sleep_stages": render_sleep_stages(agg),
-        "activity_score": render_activity_score(agg),
-        "steps":        render_steps(agg),
-        "calories":     render_calories(agg),
-        "stress":       render_stress(agg),
-        "resting_hr":   render_resting_hr(agg),
+        "sleep_efficiency":  render_sleep_efficiency(agg),
+        "sleep_stages":      render_sleep_stages(agg),
+        "activity_minutes":  render_activity_minutes(agg),
+        "steps":             render_steps(agg),
+        "calories":          render_calories(agg),
+        "stress":            render_stress(agg),
+        "resting_hr":        render_resting_hr(agg),
     }
 
     if "--dry-run" in sys.argv:
