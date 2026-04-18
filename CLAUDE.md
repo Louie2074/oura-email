@@ -26,16 +26,24 @@ Use the **Personal Access Token** flow (`Authorization: Bearer $OURA_PAT`). The 
 ## Oura API gotchas
 
 - Endpoints are under `https://api.ouraring.com/v2/usercollection`.
-- All daily endpoints accept `start_date` / `end_date` (YYYY-MM-DD); `/heartrate` uses `start_datetime` / `end_datetime` (ISO datetime).
+- All daily endpoints accept `start_date` / `end_date` (YYYY-MM-DD).
 - `/daily_stress` does **not** have a `score` field. The numeric stress metric is `stress_high` (seconds in high-stress zone). The script charts this in minutes/day.
 - `/sleep` can return multiple sessions per day (e.g. naps); the script picks the longest by `total_sleep_duration`.
+- Resting HR comes from `/sleep.lowest_heart_rate` (matches what Oura's app shows). The `/heartrate` time-series endpoint is NOT used — averaging 24h BPM produces a misleading ~85–90 bpm figure for a healthy user because it includes workouts and stress spikes.
 - Pagination: responses include `next_token` when there's more data — `oura_get()` follows it automatically.
 
-## Charting conventions
+## Charting / email conventions
 
-- Always render exactly 7 days. Missing days are kept as `None` in aggregation and rendered as `nan` (matplotlib leaves a gap) so the x-axis stays consistent.
-- One dashboard PNG (3×2 subplots), embedded inline via `Content-ID: <dashboard>`. Don't link external images — Gmail strips them.
+- Always render exactly 7 days. Missing days stay as `None` in aggregation and render as `nan` (matplotlib leaves a gap) so the x-axis stays consistent.
+- One PNG **per chart** (7 total), each full-width at figsize=(10, 3.8), dpi=200. Do NOT go back to a single multi-subplot dashboard — it's unreadable on mobile.
+- Each chart is attached inline via a distinct `Content-ID` (`sleep_score`, `sleep_stages`, `activity_score`, `steps`, `calories`, `stress`, `resting_hr`).
+- HTML layout uses tables (not flex/grid) with inline styles only — Gmail strips `<style>` blocks and doesn't honor flex/grid reliably.
+- Accent color palette lives in constants at the top of `weekly_report.py`. Keep matplotlib chart colors and HTML accent colors in sync.
 - Use `matplotlib.use("Agg")` at import time so the script works headless (CI has no display).
+
+## Local preview
+
+`python weekly_report.py --dry-run` writes `preview.html` + all chart PNGs to the project root (without sending email). Open `preview.html` in a browser to iterate on layout/styling before burning through your inbox.
 
 ## Local dev
 

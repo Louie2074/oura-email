@@ -3,4 +3,12 @@
 __pycache__/
 *.pyc
 preview.png
+preview.html
+sleep_score.png
+sleep_stages.png
+activity_score.png
+steps.png
+calories.png
+stress.png
+resting_hr.png
 .DS_Store
