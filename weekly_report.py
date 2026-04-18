@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Weekly Oura health report.
 
-Fetches the last 7 days of Oura Ring data, renders one chart per metric,
-and emails them in a styled HTML layout via Gmail SMTP.
+Fetches the last 14 days of Oura data (last 7 + prior 7 for WoW comparison),
+renders one chart per metric with target zones + best/worst callouts,
+and emails a styled HTML layout via Gmail SMTP.
 
 Required env vars (.env):
     OURA_PAT              Personal Access Token from cloud.ouraring.com/personal-access-tokens
@@ -15,7 +16,7 @@ from __future__ import annotations
 import os
 import smtplib
 import sys
-from datetime import date, datetime, time, timedelta
+from datetime import date, timedelta
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -41,20 +42,33 @@ ORANGE = "#F97316"
 AMBER = "#F59E0B"
 PINK = "#EC4899"
 RED = "#EF4444"
+GREEN = "#10B981"
+GREEN_DARK = "#047857"
 SLATE_TEXT = "#0F172A"
 SLATE_MUTED = "#64748B"
 SLATE_GRID = "#E2E8F0"
 
+# Benchmarks / targets
+SLEEP_EFFICIENCY_GOOD = (85, 100)
+RHR_GOOD = (50, 65)
+ACTIVE_MIN_TARGET_PER_DAY = 21  # WHO: 150 min/week ≈ 21 min/day
+STEPS_TARGET = 10_000
 
-def env(name: str, default: str | None = None) -> str:
-    val = os.environ.get(name, default)
+FONT_STACK = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+
+
+# ---------------------------------------------------------------------------
+# Fetch + aggregate
+# ---------------------------------------------------------------------------
+
+def env(name: str) -> str:
+    val = os.environ.get(name)
     if not val:
         sys.exit(f"Missing required env var: {name}")
     return val
 
 
 def oura_get(token: str, path: str, params: dict) -> list[dict]:
-    """GET an Oura endpoint, following next_token pagination, return concatenated data."""
     headers = {"Authorization": f"Bearer {token}"}
     url = f"{OURA_BASE}{path}"
     out: list[dict] = []
@@ -70,23 +84,23 @@ def oura_get(token: str, path: str, params: dict) -> list[dict]:
 
 
 def fetch_all(token: str, start: date, end: date) -> dict:
-    date_params = {"start_date": start.isoformat(), "end_date": end.isoformat()}
+    dp = {"start_date": start.isoformat(), "end_date": end.isoformat()}
     return {
-        "daily_sleep": oura_get(token, "/daily_sleep", date_params),
-        "sleep": oura_get(token, "/sleep", date_params),
-        "daily_activity": oura_get(token, "/daily_activity", date_params),
-        "daily_stress": oura_get(token, "/daily_stress", date_params),
+        "daily_sleep":    oura_get(token, "/daily_sleep", dp),
+        "sleep":          oura_get(token, "/sleep", dp),
+        "daily_activity": oura_get(token, "/daily_activity", dp),
+        "daily_stress":   oura_get(token, "/daily_stress", dp),
     }
 
 
 def aggregate(raw: dict, days: list[date]) -> dict:
     keys = [d.isoformat() for d in days]
 
-    def by_day(items: list[dict], field: str) -> list:
+    def by_day(items, field):
         m = {it["day"]: it.get(field) for it in items if "day" in it}
         return [m.get(k) for k in keys]
 
-    # Pick the longest sleep session per day (filter out naps)
+    # Pick longest sleep session per day (filter out naps)
     longest: dict[str, dict] = {}
     for s in raw["sleep"]:
         d = s.get("day")
@@ -95,34 +109,31 @@ def aggregate(raw: dict, days: list[date]) -> dict:
         cur = longest.get(d)
         if cur is None or (s.get("total_sleep_duration") or 0) > (cur.get("total_sleep_duration") or 0):
             longest[d] = s
+
     deep  = [(longest.get(k, {}).get("deep_sleep_duration")  or 0) / 3600 for k in keys]
     rem   = [(longest.get(k, {}).get("rem_sleep_duration")   or 0) / 3600 for k in keys]
     light = [(longest.get(k, {}).get("light_sleep_duration") or 0) / 3600 for k in keys]
     total_sleep_hr = [d + r + l for d, r, l in zip(deep, rem, light)]
-    resting_hr = [longest.get(k, {}).get("lowest_heart_rate") for k in keys]
-    sleep_efficiency = [longest.get(k, {}).get("efficiency") for k in keys]
+    resting_hr       = [longest.get(k, {}).get("lowest_heart_rate") for k in keys]
+    sleep_efficiency = [longest.get(k, {}).get("efficiency")        for k in keys]
 
     steps    = by_day(raw["daily_activity"], "steps")
     calories = by_day(raw["daily_activity"], "active_calories")
 
-    def _sec_to_min(xs):
+    def sec_to_min(xs):
         return [(v / 60) if v is not None else None for v in xs]
 
-    high_activity_min   = _sec_to_min(by_day(raw["daily_activity"], "high_activity_time"))
-    medium_activity_min = _sec_to_min(by_day(raw["daily_activity"], "medium_activity_time"))
+    high_activity_min   = sec_to_min(by_day(raw["daily_activity"], "high_activity_time"))
+    medium_activity_min = sec_to_min(by_day(raw["daily_activity"], "medium_activity_time"))
 
-    stress_min = [
-        (v / 60) if v is not None else None
-        for v in by_day(raw["daily_stress"], "stress_high")
-    ]
+    stress_min   = sec_to_min(by_day(raw["daily_stress"], "stress_high"))
+    recovery_min = sec_to_min(by_day(raw["daily_stress"], "recovery_high"))
 
     return {
-        "labels": [d.strftime("%a") for d in days],
+        "labels":     [d.strftime("%a") for d in days],
         "sub_labels": [d.strftime("%-m/%-d") for d in days],
         "sleep_efficiency": sleep_efficiency,
-        "deep": deep,
-        "rem": rem,
-        "light": light,
+        "deep": deep, "rem": rem, "light": light,
         "total_sleep_hr": total_sleep_hr,
         "resting_hr": resting_hr,
         "high_activity_min": high_activity_min,
@@ -130,6 +141,7 @@ def aggregate(raw: dict, days: list[date]) -> dict:
         "steps": steps,
         "calories": calories,
         "stress_min": stress_min,
+        "recovery_min": recovery_min,
     }
 
 
@@ -137,7 +149,7 @@ def aggregate(raw: dict, days: list[date]) -> dict:
 # Chart rendering
 # ---------------------------------------------------------------------------
 
-def _setup_style() -> None:
+def _setup_style():
     plt.rcParams.update({
         "font.family": ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"],
         "font.size": 12,
@@ -185,147 +197,337 @@ def _to_png(fig) -> bytes:
     return buf.getvalue()
 
 
-def _annotate_points(ax, x, ys, color, fmt="{:.0f}", dy=14):
-    for xi, y in zip(x, ys):
-        if y is None:
-            continue
-        ax.annotate(fmt.format(y), (xi, y), textcoords="offset points",
-                    xytext=(0, dy), ha="center", fontsize=11,
-                    fontweight="bold", color=color)
+def _extremes(values, good_is_high=True):
+    """Return (best_i, best_v, worst_i, worst_v) or None if fewer than 2 points."""
+    pairs = [(i, v) for i, v in enumerate(values) if v is not None]
+    if len(pairs) < 2:
+        return None
+    max_i, max_v = max(pairs, key=lambda p: p[1])
+    min_i, min_v = min(pairs, key=lambda p: p[1])
+    if good_is_high:
+        return max_i, max_v, min_i, min_v
+    return min_i, min_v, max_i, max_v
 
 
-def _line_chart(agg, key, title, color, fmt="{:.0f}", ymax=None, suffix=""):
+def _annotate_extreme_labels(ax, labels, extremes, y_best, y_worst,
+                             best_color, worst_color, dy_best=22, dy_worst=-22):
+    best_i, best_v, worst_i, worst_v = extremes
+    ax.annotate(f"Best · {labels[best_i]}",
+                (best_i, y_best), textcoords="offset points",
+                xytext=(0, dy_best), ha="center", fontsize=9, fontweight="bold",
+                color=best_color)
+    ax.annotate(f"Low · {labels[worst_i]}",
+                (worst_i, y_worst), textcoords="offset points",
+                xytext=(0, dy_worst), ha="center", va="top", fontsize=9, fontweight="bold",
+                color=worst_color)
+
+
+def _line_chart(agg, key, title, color, fmt="{:.0f}", suffix="", ymax=None,
+                target_zone=None, target_label=None, good_is_high=True):
     fig, ax = plt.subplots(figsize=(10, 3.8))
     x = list(range(len(agg["labels"])))
-    ys = _none_to_nan(agg[key])
+    values = agg[key]
+    ys = _none_to_nan(values)
+
+    if target_zone:
+        ax.axhspan(target_zone[0], target_zone[1], color=GREEN, alpha=0.08, zorder=1)
+        if target_label:
+            ax.text(len(x) - 0.5, target_zone[1], target_label,
+                    color=GREEN_DARK, fontsize=9, fontweight="bold",
+                    ha="right", va="bottom", alpha=0.85)
+
     ax.plot(x, ys, color=color, linewidth=2.5, zorder=3)
     ax.scatter(x, ys, s=110, color="white", edgecolors=color, linewidths=2.5, zorder=4)
-    _annotate_points(ax, x, agg[key], color, fmt=fmt + suffix)
-    ax.set_title(title)
-    ax.set_xticks(x)
-    ax.set_xticklabels(_x_labels(agg))
-    if ymax is not None:
-        # Headroom for labels
-        cur_top = max([v for v in agg[key] if v is not None], default=0)
-        ax.set_ylim(0, max(ymax, cur_top * 1.18))
-    else:
-        cur_top = max([v for v in agg[key] if v is not None], default=0)
-        ax.set_ylim(0, cur_top * 1.25 if cur_top else 1)
-    return _to_png(fig)
 
+    ex = _extremes(values, good_is_high=good_is_high)
+    if ex:
+        best_i, best_v, worst_i, worst_v = ex
+        ax.scatter([best_i], [best_v], s=180, color=GREEN, zorder=6,
+                   edgecolors="white", linewidths=2)
+        ax.scatter([worst_i], [worst_v], s=180, color=SLATE_MUTED, zorder=6,
+                   edgecolors="white", linewidths=2)
 
-def _bar_chart(agg, key, title, color, fmt="{:.0f}"):
-    fig, ax = plt.subplots(figsize=(10, 3.8))
-    x = list(range(len(agg["labels"])))
-    ys = _none_to_nan(agg[key])
-    ax.bar(x, ys, color=color, width=0.55, zorder=3)
-    for xi, y in zip(x, agg[key]):
+    for xi, y in zip(x, values):
         if y is None:
             continue
-        ax.annotate(fmt.format(y), (xi, y), textcoords="offset points",
-                    xytext=(0, 6), ha="center", fontsize=11,
-                    fontweight="bold", color=SLATE_TEXT)
+        ax.annotate(fmt.format(y) + suffix, (xi, y), textcoords="offset points",
+                    xytext=(0, 14), ha="center", fontsize=11,
+                    fontweight="bold", color=color)
+
     ax.set_title(title)
-    ax.set_xticks(x)
-    ax.set_xticklabels(_x_labels(agg))
-    cur_top = max([v for v in agg[key] if v is not None], default=0)
-    ax.set_ylim(0, cur_top * 1.20 if cur_top else 1)
+    ax.set_xticks(x); ax.set_xticklabels(_x_labels(agg))
+
+    cur_top = max([v for v in values if v is not None], default=0)
+    cur_bot = min([v for v in values if v is not None], default=0)
+    if ymax is not None:
+        top = max(ymax, cur_top * 1.18)
+    else:
+        top = cur_top * 1.25 if cur_top else 1
+    bot = 0 if cur_bot >= 0 else cur_bot * 1.1
+    # For RHR, don't start at 0 — it squashes the signal
+    if key == "resting_hr" and cur_bot > 0:
+        bot = max(0, cur_bot - 5)
+        top = cur_top + 8
+    ax.set_ylim(bot, top)
     return _to_png(fig)
 
 
-def render_sleep_efficiency(agg) -> bytes:
-    return _line_chart(agg, "sleep_efficiency", "Sleep Efficiency (%)", INDIGO, ymax=100, suffix="%")
+def render_sleep_efficiency(agg):
+    return _line_chart(agg, "sleep_efficiency", "Sleep Efficiency",
+                       INDIGO, suffix="%", ymax=100,
+                       target_zone=SLEEP_EFFICIENCY_GOOD,
+                       target_label="target zone",
+                       good_is_high=True)
 
 
-def render_sleep_stages(agg) -> bytes:
-    fig, ax = plt.subplots(figsize=(10, 3.8))
+def render_sleep_stages(agg):
+    fig, ax = plt.subplots(figsize=(10, 4.2))
     x = list(range(len(agg["labels"])))
-    deep = agg["deep"]; rem = agg["rem"]; light = agg["light"]
-    ax.bar(x, deep,  color=INDIGO_DEEP,  width=0.55, label="Deep", zorder=3)
-    ax.bar(x, rem,   bottom=deep, color=INDIGO_MID,  width=0.55, label="REM",  zorder=3)
-    ax.bar(x, light, bottom=[a+b for a, b in zip(deep, rem)],
-           color=INDIGO_LIGHT, width=0.55, label="Light", zorder=3)
-    totals = [d+r+l for d, r, l in zip(deep, rem, light)]
+    deep, rem, light = agg["deep"], agg["rem"], agg["light"]
+
+    ax.bar(x, deep,  color=INDIGO_DEEP,  width=0.6, label="Deep", zorder=3)
+    ax.bar(x, rem,   bottom=deep, color=INDIGO_MID,  width=0.6, label="REM", zorder=3)
+    ax.bar(x, light, bottom=[a + b for a, b in zip(deep, rem)],
+           color=INDIGO_LIGHT, width=0.6, label="Light", zorder=3)
+
+    # Per-segment labels, centered inside each colored region (skip tiny segments)
+    MIN_SEG = 0.4
+    for xi, d, r, l in zip(x, deep, rem, light):
+        if d >= MIN_SEG:
+            ax.text(xi, d / 2, f"{d:.1f}h", ha="center", va="center",
+                    fontsize=10, fontweight="bold", color="white")
+        if r >= MIN_SEG:
+            ax.text(xi, d + r / 2, f"{r:.1f}h", ha="center", va="center",
+                    fontsize=10, fontweight="bold", color="white")
+        if l >= MIN_SEG:
+            ax.text(xi, d + r + l / 2, f"{l:.1f}h", ha="center", va="center",
+                    fontsize=10, fontweight="bold", color=INDIGO_DEEP)
+
+    totals = [d + r + l for d, r, l in zip(deep, rem, light)]
     for xi, t in zip(x, totals):
         if t > 0:
-            ax.annotate(f"{t:.1f}h", (xi, t), textcoords="offset points",
-                        xytext=(0, 6), ha="center", fontsize=11,
-                        fontweight="bold", color=SLATE_TEXT)
-    ax.set_title("Sleep Stages (hours)")
+            ax.annotate(f"{t:.1f}h total", (xi, t),
+                        textcoords="offset points", xytext=(0, 6),
+                        ha="center", fontsize=10, fontweight="bold",
+                        color=SLATE_TEXT)
+
+    ax.set_title("Sleep Stages")
     ax.set_xticks(x); ax.set_xticklabels(_x_labels(agg))
     ax.legend(loc="upper right", frameon=False, fontsize=10,
               labelcolor=SLATE_MUTED, ncols=3)
-    cur_top = max(totals, default=0)
-    ax.set_ylim(0, cur_top * 1.25 if cur_top else 1)
-    return _to_png(fig)
-
-
-def render_activity_minutes(agg) -> bytes:
-    fig, ax = plt.subplots(figsize=(10, 3.8))
-    x = list(range(len(agg["labels"])))
-    high = [v or 0 for v in agg["high_activity_min"]]
-    med  = [v or 0 for v in agg["medium_activity_min"]]
-    ax.bar(x, high, color=ORANGE, width=0.55, label="High intensity", zorder=3)
-    ax.bar(x, med,  bottom=high, color=AMBER, width=0.55, label="Moderate intensity", zorder=3)
-    totals = [h + m for h, m in zip(high, med)]
-    for xi, t in zip(x, totals):
-        if t > 0:
-            ax.annotate(f"{t:.0f}m", (xi, t), textcoords="offset points",
-                        xytext=(0, 6), ha="center", fontsize=11,
-                        fontweight="bold", color=SLATE_TEXT)
-    ax.set_title("Active Minutes")
-    ax.set_xticks(x); ax.set_xticklabels(_x_labels(agg))
-    ax.legend(loc="upper right", frameon=False, fontsize=10, labelcolor=SLATE_MUTED, ncols=2)
     cur_top = max(totals, default=0)
     ax.set_ylim(0, cur_top * 1.30 if cur_top else 1)
     return _to_png(fig)
 
 
-def render_steps(agg) -> bytes:
-    return _bar_chart(agg, "steps", "Steps", ORANGE, fmt="{:,.0f}")
+def render_activity_minutes(agg):
+    fig, ax = plt.subplots(figsize=(10, 4.2))
+    x = list(range(len(agg["labels"])))
+    high = [v or 0 for v in agg["high_activity_min"]]
+    med  = [v or 0 for v in agg["medium_activity_min"]]
+
+    ax.bar(x, high, color=ORANGE, width=0.6, label="High intensity", zorder=3)
+    ax.bar(x, med,  bottom=high, color=AMBER, width=0.6,
+           label="Moderate intensity", zorder=3)
+
+    # WHO target line (21 min/day)
+    ax.axhline(ACTIVE_MIN_TARGET_PER_DAY, color=GREEN, linewidth=1.5,
+               linestyle="--", zorder=2, alpha=0.8)
+    ax.text(len(x) - 0.5, ACTIVE_MIN_TARGET_PER_DAY + 1.5,
+            f"{ACTIVE_MIN_TARGET_PER_DAY} min daily goal",
+            color=GREEN_DARK, fontsize=9, fontweight="bold",
+            ha="right", va="bottom", alpha=0.85)
+
+    # Per-segment labels
+    MIN_SEG = 4
+    for xi, h, m in zip(x, high, med):
+        if h >= MIN_SEG:
+            ax.text(xi, h / 2, f"{h:.0f}", ha="center", va="center",
+                    fontsize=10, fontweight="bold", color="white")
+        if m >= MIN_SEG:
+            ax.text(xi, h + m / 2, f"{m:.0f}", ha="center", va="center",
+                    fontsize=10, fontweight="bold", color="white")
+
+    totals = [h + m for h, m in zip(high, med)]
+    for xi, t in zip(x, totals):
+        if t > 0:
+            ax.annotate(f"{t:.0f}m", (xi, t), textcoords="offset points",
+                        xytext=(0, 6), ha="center", fontsize=10,
+                        fontweight="bold", color=SLATE_TEXT)
+    ax.set_title("Active Minutes")
+    ax.set_xticks(x); ax.set_xticklabels(_x_labels(agg))
+    ax.legend(loc="upper left", frameon=False, fontsize=10,
+              labelcolor=SLATE_MUTED, ncols=2)
+    cur_top = max(totals, default=0)
+    ax.set_ylim(0, max(ACTIVE_MIN_TARGET_PER_DAY * 1.8, cur_top * 1.30))
+    return _to_png(fig)
 
 
-def render_calories(agg) -> bytes:
-    return _bar_chart(agg, "calories", "Active Calories", AMBER, fmt="{:,.0f}")
+def _bar_with_highlight(agg, key, title, color, fmt="{:.0f}",
+                        target=None, target_label=None):
+    fig, ax = plt.subplots(figsize=(10, 3.8))
+    x = list(range(len(agg["labels"])))
+    values = agg[key]
+    ys = _none_to_nan(values)
+
+    ex = _extremes(values, good_is_high=True)
+    bars = ax.bar(x, ys, color=color, width=0.6, zorder=3, alpha=0.55)
+    if ex:
+        best_i, _, worst_i, _ = ex
+        bars[best_i].set_alpha(1.0)
+        bars[worst_i].set_alpha(0.3)
+
+    if target is not None:
+        ax.axhline(target, color=GREEN, linewidth=1.5, linestyle="--",
+                   zorder=2, alpha=0.8)
+        if target_label:
+            ax.text(len(x) - 0.5, target * 1.01, target_label,
+                    color=GREEN_DARK, fontsize=9, fontweight="bold",
+                    ha="right", va="bottom", alpha=0.85)
+
+    for xi, y in zip(x, values):
+        if y is None:
+            continue
+        prefix = "★ " if ex and xi == ex[0] else ""
+        ax.annotate(prefix + fmt.format(y), (xi, y),
+                    textcoords="offset points", xytext=(0, 6),
+                    ha="center", fontsize=11, fontweight="bold",
+                    color=SLATE_TEXT)
+
+    ax.set_title(title)
+    ax.set_xticks(x); ax.set_xticklabels(_x_labels(agg))
+    cur_top = max([v for v in values if v is not None], default=0)
+    ymax_val = max(cur_top, target or 0) * 1.22
+    ax.set_ylim(0, ymax_val if ymax_val else 1)
+    return _to_png(fig)
 
 
-def render_stress(agg) -> bytes:
-    return _line_chart(agg, "stress_min", "High-Stress Time (minutes)", PINK, suffix="m")
+def render_steps(agg):
+    return _bar_with_highlight(agg, "steps", "Steps", ORANGE, fmt="{:,.0f}",
+                               target=STEPS_TARGET,
+                               target_label=f"{STEPS_TARGET:,} step goal")
 
 
-def render_resting_hr(agg) -> bytes:
-    return _line_chart(agg, "resting_hr", "Resting Heart Rate (bpm)", RED)
+def render_calories(agg):
+    return _bar_with_highlight(agg, "calories", "Active Calories", AMBER,
+                               fmt="{:,.0f}")
+
+
+def render_stress_recovery(agg):
+    fig, ax = plt.subplots(figsize=(10, 4.2))
+    x = list(range(len(agg["labels"])))
+    recovery = [v or 0 for v in agg["recovery_min"]]
+    stress   = [v or 0 for v in agg["stress_min"]]
+
+    ax.bar(x, recovery, color=GREEN, width=0.6, zorder=3,
+           label="Recovery time")
+    ax.bar(x, [-s for s in stress], color=PINK, width=0.6, zorder=3,
+           label="High-stress time")
+    ax.axhline(0, color=SLATE_TEXT, linewidth=1, zorder=4)
+
+    for xi, r in zip(x, recovery):
+        if r > 0:
+            ax.annotate(f"{r:.0f}m", (xi, r), textcoords="offset points",
+                        xytext=(0, 4), ha="center", fontsize=10,
+                        fontweight="bold", color=GREEN_DARK)
+    for xi, s in zip(x, stress):
+        if s > 0:
+            ax.annotate(f"{s:.0f}m", (xi, -s), textcoords="offset points",
+                        xytext=(0, -4), ha="center", va="top",
+                        fontsize=10, fontweight="bold", color=PINK)
+
+    ax.set_title("Stress vs. Recovery")
+    ax.set_xticks(x); ax.set_xticklabels(_x_labels(agg))
+    ax.legend(loc="upper right", frameon=False, fontsize=10,
+              labelcolor=SLATE_MUTED, ncols=2)
+
+    max_abs = max(max(recovery, default=0), max(stress, default=0))
+    ymax_val = max_abs * 1.40 if max_abs else 1
+    ax.set_ylim(-ymax_val, ymax_val)
+    ax.set_yticks([])  # signed axis labels add clutter; colors speak for themselves
+    return _to_png(fig)
+
+
+def render_resting_hr(agg):
+    return _line_chart(agg, "resting_hr", "Resting Heart Rate",
+                       RED, suffix=" bpm",
+                       target_zone=RHR_GOOD,
+                       target_label="healthy range",
+                       good_is_high=False)
 
 
 # ---------------------------------------------------------------------------
 # HTML email
 # ---------------------------------------------------------------------------
 
-def _safe_avg(xs: list) -> float | None:
+def _safe_avg(xs):
     vals = [x for x in xs if x is not None]
     return round(mean(vals), 1) if vals else None
 
 
-def _safe_sum(xs: list) -> int | None:
+def _safe_sum(xs):
     vals = [x for x in xs if x is not None]
     return int(sum(vals)) if vals else None
 
 
-def _stat_card(label: str, value: str, sublabel: str, accent: str) -> str:
+def _sparkline(values, accent):
+    """Tiny inline SVG trend line — sharper than a PNG, zero extra deps."""
+    width, height = 92, 28
+    vs = [v for v in values if v is not None]
+    if len(vs) < 2:
+        return ""
+    vmin, vmax = min(vs), max(vs)
+    rng = max(vmax - vmin, 1e-9)
+    pts = []
+    last = None
+    for i, v in enumerate(values):
+        if v is None:
+            continue
+        x = 3 + (i / max(len(values) - 1, 1)) * (width - 6)
+        y = 3 + (1 - (v - vmin) / rng) * (height - 6)
+        pts.append(f"{x:.1f},{y:.1f}")
+        last = (x, y)
+    poly = f'<polyline points="{" ".join(pts)}" fill="none" stroke="{accent}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+    dot = f'<circle cx="{last[0]:.1f}" cy="{last[1]:.1f}" r="2.2" fill="{accent}"/>' if last else ""
+    return (
+        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        f'xmlns="http://www.w3.org/2000/svg" style="display:block;margin:10px auto 0 auto;">'
+        f'{poly}{dot}</svg>'
+    )
+
+
+def _delta_html(cur, prev, good_is_up=True, suffix="", fmt="{:+.1f}"):
+    if cur is None or prev is None:
+        return ""
+    delta = cur - prev
+    if abs(delta) < 0.05:
+        return (f'<div style="font:500 11px/1 {FONT_STACK};'
+                f'color:{SLATE_MUTED};margin-top:4px;">— flat vs last week</div>')
+    improving = (delta > 0) == good_is_up
+    color = GREEN_DARK if improving else RED
+    arrow = "↑" if delta > 0 else "↓"
+    return (f'<div style="font:600 11px/1 {FONT_STACK};'
+            f'color:{color};margin-top:4px;">'
+            f'{arrow} {fmt.format(delta)}{suffix} vs last week</div>')
+
+
+def _stat_card(label, value, sublabel, accent, delta_html="", sparkline_svg=""):
     return f"""
     <td valign="top" align="center" width="50%" style="padding:6px;">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;border:1px solid {SLATE_GRID};border-radius:14px;">
         <tr><td align="center" style="padding:18px 14px 16px 14px;">
-          <div style="font:600 11px/1 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;letter-spacing:1.2px;text-transform:uppercase;color:{SLATE_MUTED};margin-bottom:8px;">{label}</div>
-          <div style="font:700 30px/1.1 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:{accent};margin-bottom:6px;">{value}</div>
-          <div style="font:500 12px/1.2 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:{SLATE_MUTED};">{sublabel}</div>
+          <div style="font:600 11px/1 {FONT_STACK};letter-spacing:1.2px;text-transform:uppercase;color:{SLATE_MUTED};margin-bottom:8px;">{label}</div>
+          <div style="font:700 30px/1.1 {FONT_STACK};color:{accent};margin-bottom:6px;">{value}</div>
+          <div style="font:500 12px/1.2 {FONT_STACK};color:{SLATE_MUTED};">{sublabel}</div>
+          {delta_html}
+          {sparkline_svg}
         </td></tr>
       </table>
     </td>
     """
 
 
-def _chart_card(cid: str) -> str:
+def _chart_card(cid):
     return f"""
     <tr><td style="padding:0 6px 12px 6px;">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;border:1px solid {SLATE_GRID};border-radius:14px;">
@@ -337,51 +539,140 @@ def _chart_card(cid: str) -> str:
     """
 
 
-def _section_header(title: str, subtitle: str) -> str:
+def _section(title, subtitle, narrative, accent, chart_cids):
+    charts_html = "".join(_chart_card(c) for c in chart_cids)
     return f"""
     <tr><td style="padding:24px 6px 8px 6px;">
-      <div style="font:700 20px/1.2 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:{SLATE_TEXT};margin-bottom:2px;">{title}</div>
-      <div style="font:400 13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:{SLATE_MUTED};">{subtitle}</div>
+      <div style="font:700 20px/1.2 {FONT_STACK};color:{SLATE_TEXT};margin-bottom:2px;">{title}</div>
+      <div style="font:400 13px/1.4 {FONT_STACK};color:{SLATE_MUTED};margin-bottom:10px;">{subtitle}</div>
+      <div style="font:500 14px/1.5 {FONT_STACK};color:{SLATE_TEXT};background:#ffffff;border:1px solid {SLATE_GRID};border-left:3px solid {accent};border-radius:8px;padding:12px 14px;margin-bottom:12px;">{narrative}</div>
+    </td></tr>
+    <tr><td>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+        {charts_html}
+      </table>
     </td></tr>
     """
 
 
-def build_html(agg: dict, start: date, end: date) -> str:
-    avg_efficiency = _safe_avg(agg["sleep_efficiency"])
-    avg_sleep_dur = _safe_avg(agg["total_sleep_hr"])
-    avg_active_min = _safe_avg([
-        (h or 0) + (m or 0)
-        for h, m in zip(agg["high_activity_min"], agg["medium_activity_min"])
-    ])
-    total_steps = _safe_sum(agg["steps"])
-    total_cal = _safe_sum(agg["calories"])
-    avg_rhr = _safe_avg(agg["resting_hr"])
+def _best_label(values, labels, good_is_high=True):
+    """Return the Day label for the best value, or '—'."""
+    pairs = [(i, v) for i, v in enumerate(values) if v is not None]
+    if not pairs:
+        return "—"
+    best_i = (max if good_is_high else min)(pairs, key=lambda p: p[1])[0]
+    return labels[best_i]
 
-    def fmt(v, suffix=""):
-        if v is None:
-            return "—"
-        if isinstance(v, float):
-            return f"{v:g}{suffix}"
+
+def _sleep_narrative(agg):
+    effs = [v for v in agg["sleep_efficiency"] if v is not None]
+    durs = [v for v in agg["total_sleep_hr"] if v and v > 0]
+    if not effs or not durs:
+        return "No sleep data available this week."
+    good = sum(1 for e in effs if e >= 85)
+    avg_dur = sum(durs) / len(durs)
+    best = _best_label(agg["sleep_efficiency"], agg["labels"], good_is_high=True)
+    return (f"{good} of {len(effs)} nights hit ≥85% efficiency, "
+            f"averaging {avg_dur:.1f}h of sleep. Best night: {best}.")
+
+
+def _activity_narrative(agg):
+    steps_vals = [s for s in agg["steps"] if s is not None]
+    if not steps_vals:
+        return "No activity data available this week."
+    total_steps = sum(steps_vals)
+    hi = [h or 0 for h in agg["high_activity_min"]]
+    med = [m or 0 for m in agg["medium_activity_min"]]
+    total_active = sum(h + m for h, m in zip(hi, med))
+    days_over_goal = sum(1 for s in steps_vals if s >= STEPS_TARGET)
+    best = _best_label(agg["steps"], agg["labels"], good_is_high=True)
+    return (f"{total_steps:,} steps across {total_active:.0f} min of moderate+ activity. "
+            f"{days_over_goal} of {len(steps_vals)} days hit {STEPS_TARGET:,} steps. "
+            f"Most active: {best}.")
+
+
+def _wellness_narrative(agg):
+    rhr = [v for v in agg["resting_hr"] if v is not None]
+    stress = [s for s in agg["stress_min"] if s is not None]
+    rec = [r for r in agg["recovery_min"] if r is not None]
+    if not rhr and not stress:
+        return "No wellness data available this week."
+    parts = []
+    if rhr:
+        parts.append(f"Resting HR averaged {sum(rhr)/len(rhr):.0f} bpm")
+    if rec and stress:
+        parts.append(f"{sum(rec)/len(rec):.0f} min recovery vs. {sum(stress)/len(stress):.0f} min high-stress per day")
+    return ". ".join(parts) + "."
+
+
+def build_html(this_wk, last_wk, start, end) -> str:
+    # This-week + last-week aggregates for delta calcs
+    avg_eff_c  = _safe_avg(this_wk["sleep_efficiency"])
+    avg_eff_p  = _safe_avg(last_wk["sleep_efficiency"])
+    avg_dur_c  = _safe_avg(this_wk["total_sleep_hr"])
+    avg_dur_p  = _safe_avg(last_wk["total_sleep_hr"])
+    avg_act_c  = _safe_avg([(h or 0) + (m or 0) for h, m in
+                            zip(this_wk["high_activity_min"], this_wk["medium_activity_min"])])
+    avg_act_p  = _safe_avg([(h or 0) + (m or 0) for h, m in
+                            zip(last_wk["high_activity_min"], last_wk["medium_activity_min"])])
+    tot_stp_c  = _safe_sum(this_wk["steps"])
+    tot_stp_p  = _safe_sum(last_wk["steps"])
+    tot_cal_c  = _safe_sum(this_wk["calories"])
+    tot_cal_p  = _safe_sum(last_wk["calories"])
+    avg_rhr_c  = _safe_avg(this_wk["resting_hr"])
+    avg_rhr_p  = _safe_avg(last_wk["resting_hr"])
+
+    def f(v, suffix=""):
+        if v is None: return "—"
+        if isinstance(v, float): return f"{v:g}{suffix}"
         return f"{v:,}{suffix}"
+
+    active_series = [(h or 0) + (m or 0) for h, m in
+                     zip(this_wk["high_activity_min"], this_wk["medium_activity_min"])]
 
     cards_html = f"""
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:6px;">
       <tr>
-        {_stat_card("Sleep Efficiency", fmt(avg_efficiency, "%"), "weekly avg", INDIGO)}
-        {_stat_card("Sleep Duration", fmt(avg_sleep_dur, " h"), "weekly avg", INDIGO)}
+        {_stat_card("Sleep Efficiency", f(avg_eff_c, "%"), "weekly avg", INDIGO,
+                    _delta_html(avg_eff_c, avg_eff_p, good_is_up=True, suffix="%"),
+                    _sparkline(this_wk["sleep_efficiency"], INDIGO))}
+        {_stat_card("Sleep Duration", f(avg_dur_c, " h"), "weekly avg", INDIGO,
+                    _delta_html(avg_dur_c, avg_dur_p, good_is_up=True, suffix="h"),
+                    _sparkline(this_wk["total_sleep_hr"], INDIGO))}
       </tr>
       <tr>
-        {_stat_card("Active Min / Day", fmt(avg_active_min, " min"), "high + moderate", ORANGE)}
-        {_stat_card("Total Steps", fmt(total_steps), "this week", ORANGE)}
+        {_stat_card("Active Min / Day", f(avg_act_c, " min"), "weekly avg", ORANGE,
+                    _delta_html(avg_act_c, avg_act_p, good_is_up=True, suffix=" min"),
+                    _sparkline(active_series, ORANGE))}
+        {_stat_card("Total Steps", f(tot_stp_c), "this week", ORANGE,
+                    _delta_html(tot_stp_c, tot_stp_p, good_is_up=True, fmt="{:+,.0f}"),
+                    _sparkline(this_wk["steps"], ORANGE))}
       </tr>
       <tr>
-        {_stat_card("Active Calories", fmt(total_cal), "this week", AMBER)}
-        {_stat_card("Resting HR", fmt(avg_rhr, " bpm"), "weekly avg", RED)}
+        {_stat_card("Active Calories", f(tot_cal_c), "this week", AMBER,
+                    _delta_html(tot_cal_c, tot_cal_p, good_is_up=True, fmt="{:+,.0f}"),
+                    _sparkline(this_wk["calories"], AMBER))}
+        {_stat_card("Resting HR", f(avg_rhr_c, " bpm"), "weekly avg", RED,
+                    _delta_html(avg_rhr_c, avg_rhr_p, good_is_up=False, suffix=" bpm"),
+                    _sparkline(this_wk["resting_hr"], RED))}
       </tr>
     </table>
     """
 
     date_range = f"{start.strftime('%B %-d')} – {end.strftime('%B %-d, %Y')}"
+
+    sleep_html = _section(
+        "Sleep", "How well and how long you rested",
+        _sleep_narrative(this_wk), INDIGO,
+        ["sleep_efficiency", "sleep_stages"])
+    activity_html = _section(
+        "Activity", "Movement and energy expenditure",
+        _activity_narrative(this_wk), ORANGE,
+        ["activity_minutes", "steps", "calories"])
+    wellness_html = _section(
+        "Wellness", "Stress load and cardiovascular recovery",
+        _wellness_narrative(this_wk), PINK,
+        ["stress_recovery", "resting_hr"])
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -389,47 +680,20 @@ def build_html(agg: dict, start: date, end: date) -> str:
   <center style="width:100%;background:#F8FAFC;padding:24px 12px;">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:680px;margin:0 auto;">
 
-      <!-- Hero -->
       <tr><td style="padding:8px 6px 20px 6px;">
-        <div style="font:600 12px/1 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;letter-spacing:1.4px;text-transform:uppercase;color:{INDIGO};margin-bottom:8px;">Weekly Health Report</div>
-        <div style="font:700 30px/1.2 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:{SLATE_TEXT};margin-bottom:4px;">Your Oura Recap</div>
-        <div style="font:400 15px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:{SLATE_MUTED};">{date_range}</div>
+        <div style="font:600 12px/1 {FONT_STACK};letter-spacing:1.4px;text-transform:uppercase;color:{INDIGO};margin-bottom:8px;">Weekly Health Report</div>
+        <div style="font:700 30px/1.2 {FONT_STACK};color:{SLATE_TEXT};margin-bottom:4px;">Your Oura Recap</div>
+        <div style="font:400 15px/1.4 {FONT_STACK};color:{SLATE_MUTED};">{date_range}</div>
       </td></tr>
 
-      <!-- Stat cards -->
       <tr><td>{cards_html}</td></tr>
 
-      <!-- Sleep section -->
-      {_section_header("Sleep", "How well and how long you rested")}
-      <tr><td>
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-          {_chart_card("sleep_efficiency")}
-          {_chart_card("sleep_stages")}
-        </table>
-      </td></tr>
+      {sleep_html}
+      {activity_html}
+      {wellness_html}
 
-      <!-- Activity section -->
-      {_section_header("Activity", "Movement and energy expenditure")}
-      <tr><td>
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-          {_chart_card("activity_minutes")}
-          {_chart_card("steps")}
-          {_chart_card("calories")}
-        </table>
-      </td></tr>
-
-      <!-- Wellness section -->
-      {_section_header("Wellness", "Stress load and cardiovascular recovery")}
-      <tr><td>
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-          {_chart_card("stress")}
-          {_chart_card("resting_hr")}
-        </table>
-      </td></tr>
-
-      <!-- Footer -->
       <tr><td align="center" style="padding:28px 6px 12px 6px;">
-        <div style="font:400 12px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:{SLATE_MUTED};">
+        <div style="font:400 12px/1.5 {FONT_STACK};color:{SLATE_MUTED};">
           Generated automatically from your Oura Ring data.
         </div>
       </td></tr>
@@ -440,8 +704,11 @@ def build_html(agg: dict, start: date, end: date) -> str:
 """
 
 
-def send_email(html: str, images: dict[str, bytes], gmail_user: str, gmail_pass: str,
-               recipient: str, subject: str) -> None:
+# ---------------------------------------------------------------------------
+# Send + main
+# ---------------------------------------------------------------------------
+
+def send_email(html, images, gmail_user, gmail_pass, recipient, subject):
     msg = MIMEMultipart("related")
     msg["Subject"] = subject
     msg["From"] = gmail_user
@@ -463,7 +730,7 @@ def send_email(html: str, images: dict[str, bytes], gmail_user: str, gmail_pass:
         server.send_message(msg)
 
 
-def main() -> None:
+def main():
     load_dotenv()
     pat = env("OURA_PAT")
     gmail_user = env("GMAIL_USER")
@@ -472,45 +739,45 @@ def main() -> None:
 
     end = date.today()
     start = end - timedelta(days=DAYS - 1)
-    days = [start + timedelta(days=i) for i in range(DAYS)]
+    prev_end = start - timedelta(days=1)
+    prev_start = prev_end - timedelta(days=DAYS - 1)
 
-    print(f"Fetching Oura data for {start} → {end}...")
-    raw = fetch_all(pat, start, end)
-    agg = aggregate(raw, days)
+    this_days = [start + timedelta(days=i) for i in range(DAYS)]
+    prev_days = [prev_start + timedelta(days=i) for i in range(DAYS)]
+
+    print(f"Fetching Oura data for {prev_start} → {end} (14 days)...")
+    raw = fetch_all(pat, prev_start, end)
+    this_wk = aggregate(raw, this_days)
+    last_wk = aggregate(raw, prev_days)
 
     print("Rendering charts...")
     _setup_style()
     images = {
-        "sleep_efficiency":  render_sleep_efficiency(agg),
-        "sleep_stages":      render_sleep_stages(agg),
-        "activity_minutes":  render_activity_minutes(agg),
-        "steps":             render_steps(agg),
-        "calories":          render_calories(agg),
-        "stress":            render_stress(agg),
-        "resting_hr":        render_resting_hr(agg),
+        "sleep_efficiency": render_sleep_efficiency(this_wk),
+        "sleep_stages":     render_sleep_stages(this_wk),
+        "activity_minutes": render_activity_minutes(this_wk),
+        "steps":            render_steps(this_wk),
+        "calories":         render_calories(this_wk),
+        "stress_recovery":  render_stress_recovery(this_wk),
+        "resting_hr":       render_resting_hr(this_wk),
     }
 
     if "--dry-run" in sys.argv:
-        out = "preview.html"
-        with open(out, "w") as f:
-            f.write(build_html(agg, start, end)
-                    .replace('src="cid:', 'src="').replace('"', '"'))
-        # Also save chart PNGs alongside so the preview HTML can reference them
+        html = build_html(this_wk, last_wk, start, end)
         for cid, png in images.items():
             with open(f"{cid}.png", "wb") as f:
                 f.write(png)
-        # Rewrite preview.html to reference local files
-        html = build_html(agg, start, end)
         for cid in images:
             html = html.replace(f"cid:{cid}", f"{cid}.png")
-        with open(out, "w") as f:
+        with open("preview.html", "w") as f:
             f.write(html)
-        print(f"Wrote {out} and {len(images)} chart PNGs. Open {out} in a browser.")
+        print(f"Wrote preview.html and {len(images)} chart PNGs.")
         return
 
     subject = f"Your Oura Weekly Report — {start.strftime('%b %-d')} to {end.strftime('%b %-d')}"
     print(f"Sending email to {recipient}...")
-    send_email(build_html(agg, start, end), images, gmail_user, gmail_pass, recipient, subject)
+    send_email(build_html(this_wk, last_wk, start, end), images,
+               gmail_user, gmail_pass, recipient, subject)
     print("Done.")
 
 

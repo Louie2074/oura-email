@@ -2,13 +2,12 @@
 .venv/
 __pycache__/
 *.pyc
-preview.png
 preview.html
-sleep_score.png
+sleep_efficiency.png
 sleep_stages.png
-activity_score.png
+activity_minutes.png
 steps.png
 calories.png
-stress.png
+stress_recovery.png
 resting_hr.png
 .DS_Store
