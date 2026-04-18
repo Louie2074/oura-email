@@ -1,0 +1,29 @@
+name: Weekly Oura Report
+
+on:
+  schedule:
+    # Mondays at 13:00 UTC = 09:00 ET / 06:00 PT.
+    # GitHub may delay scheduled runs; that's expected.
+    - cron: "0 13 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  send-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - run: python weekly_report.py
+        env:
+          OURA_PAT: ${{ secrets.OURA_PAT }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
