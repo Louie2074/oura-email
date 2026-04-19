@@ -746,8 +746,9 @@ def main():
     gmail_pass = env("GMAIL_APP_PASSWORD")
     recipient = os.environ.get("EMAIL_TO") or gmail_user
 
-    # End window at yesterday — today is in-progress and /sleep hasn't synced
-    end = date.today() - timedelta(days=1)
+    # Window ends today — Oura labels last night's sleep with today's date
+    # (the day you woke up). Fix 1 ensures unsynced days render as gaps, not zeros.
+    end = date.today()
     start = end - timedelta(days=DAYS - 1)
     prev_end = start - timedelta(days=1)
     prev_start = prev_end - timedelta(days=DAYS - 1)
