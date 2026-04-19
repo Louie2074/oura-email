@@ -168,12 +168,17 @@ def aggregate(raw: dict, days: list[date]) -> dict:
     }
 
 
+MIN_SAMPLES_FOR_PEAK = 10  # Typical full-hour coverage is ~12 samples (5-min cadence)
+
+
 def _stress_clock(samples: list[dict], days: list[date], baseline: int):
     """Bucket waking, non-workout HR samples into a 7×24 grid.
 
     Each cell = max(0, mean(bpm) − baseline) for samples that fall in that
     (day, hour) bucket. Empty cells are None. Returns (grid, top_peaks) where
     top_peaks is a list of (row_index, hour, excess) sorted desc, capped at 3.
+    Peaks only consider cells with MIN_SAMPLES_FOR_PEAK+ samples so that sparse
+    buckets (e.g. brief ring-wear near bedtime) can't produce false positives.
     """
     WAKING = {"awake", "rest", "live"}  # exclude sleep/workout/session
     buckets: dict[tuple[str, int], list[int]] = defaultdict(list)
@@ -191,7 +196,7 @@ def _stress_clock(samples: list[dict], days: list[date], baseline: int):
         buckets[(ts.date().isoformat(), ts.hour)].append(bpm)
 
     grid: list[list[float | None]] = []
-    peaks: list[tuple[int, int, float]] = []
+    peak_candidates: list[tuple[int, int, float]] = []
     for i, d in enumerate(days):
         row: list[float | None] = []
         key = d.isoformat()
@@ -202,11 +207,11 @@ def _stress_clock(samples: list[dict], days: list[date], baseline: int):
                 continue
             excess = max(0.0, sum(vals) / len(vals) - baseline)
             row.append(excess)
-            if excess > 0:
-                peaks.append((i, h, excess))
+            if excess > 0 and len(vals) >= MIN_SAMPLES_FOR_PEAK:
+                peak_candidates.append((i, h, excess))
         grid.append(row)
-    peaks.sort(key=lambda p: -p[2])
-    return grid, peaks[:3]
+    peak_candidates.sort(key=lambda p: -p[2])
+    return grid, peak_candidates[:3]
 
 
 # ---------------------------------------------------------------------------
