@@ -86,7 +86,6 @@ def oura_get(token: str, path: str, params: dict) -> list[dict]:
 def fetch_all(token: str, start: date, end: date) -> dict:
     dp = {"start_date": start.isoformat(), "end_date": end.isoformat()}
     return {
-        "daily_sleep":    oura_get(token, "/daily_sleep", dp),
         "sleep":          oura_get(token, "/sleep", dp),
         "daily_activity": oura_get(token, "/daily_activity", dp),
         "daily_stress":   oura_get(token, "/daily_stress", dp),
@@ -110,10 +109,17 @@ def aggregate(raw: dict, days: list[date]) -> dict:
         if cur is None or (s.get("total_sleep_duration") or 0) > (cur.get("total_sleep_duration") or 0):
             longest[d] = s
 
-    deep  = [(longest.get(k, {}).get("deep_sleep_duration")  or 0) / 3600 for k in keys]
-    rem   = [(longest.get(k, {}).get("rem_sleep_duration")   or 0) / 3600 for k in keys]
-    light = [(longest.get(k, {}).get("light_sleep_duration") or 0) / 3600 for k in keys]
-    total_sleep_hr = [d + r + l for d, r, l in zip(deep, rem, light)]
+    def _hours(k, field):
+        v = longest.get(k, {}).get(field)
+        return v / 3600 if v is not None else None
+
+    deep  = [_hours(k, "deep_sleep_duration")  for k in keys]
+    rem   = [_hours(k, "rem_sleep_duration")   for k in keys]
+    light = [_hours(k, "light_sleep_duration") for k in keys]
+    total_sleep_hr = [
+        (d + r + l) if None not in (d, r, l) else None
+        for d, r, l in zip(deep, rem, light)
+    ]
     resting_hr       = [longest.get(k, {}).get("lowest_heart_rate") for k in keys]
     sleep_efficiency = [longest.get(k, {}).get("efficiency")        for k in keys]
 
@@ -283,14 +289,17 @@ def render_sleep_efficiency(agg):
 def render_sleep_stages(agg):
     fig, ax = plt.subplots(figsize=(10, 4.2))
     x = list(range(len(agg["labels"])))
-    deep, rem, light = agg["deep"], agg["rem"], agg["light"]
+    deep  = _none_to_nan(agg["deep"])
+    rem   = _none_to_nan(agg["rem"])
+    light = _none_to_nan(agg["light"])
 
     ax.bar(x, deep,  color=INDIGO_DEEP,  width=0.6, label="Deep", zorder=3)
     ax.bar(x, rem,   bottom=deep, color=INDIGO_MID,  width=0.6, label="REM", zorder=3)
     ax.bar(x, light, bottom=[a + b for a, b in zip(deep, rem)],
            color=INDIGO_LIGHT, width=0.6, label="Light", zorder=3)
 
-    # Per-segment labels, centered inside each colored region (skip tiny segments)
+    # Per-segment labels, centered inside each colored region (skip tiny / missing).
+    # NaN comparisons always return False, so missing days drop out naturally.
     MIN_SEG = 0.4
     for xi, d, r, l in zip(x, deep, rem, light):
         if d >= MIN_SEG:
@@ -303,9 +312,9 @@ def render_sleep_stages(agg):
             ax.text(xi, d + r + l / 2, f"{l:.1f}h", ha="center", va="center",
                     fontsize=10, fontweight="bold", color=INDIGO_DEEP)
 
-    totals = [d + r + l for d, r, l in zip(deep, rem, light)]
+    totals = agg["total_sleep_hr"]
     for xi, t in zip(x, totals):
-        if t > 0:
+        if t is not None and t > 0:
             ax.annotate(f"{t:.1f}h total", (xi, t),
                         textcoords="offset points", xytext=(0, 6),
                         ha="center", fontsize=10, fontweight="bold",
@@ -315,7 +324,7 @@ def render_sleep_stages(agg):
     ax.set_xticks(x); ax.set_xticklabels(_x_labels(agg))
     ax.legend(loc="upper right", frameon=False, fontsize=10,
               labelcolor=SLATE_MUTED, ncols=3)
-    cur_top = max(totals, default=0)
+    cur_top = max([t for t in totals if t is not None], default=0)
     ax.set_ylim(0, cur_top * 1.30 if cur_top else 1)
     return _to_png(fig)
 
@@ -737,7 +746,8 @@ def main():
     gmail_pass = env("GMAIL_APP_PASSWORD")
     recipient = os.environ.get("EMAIL_TO") or gmail_user
 
-    end = date.today()
+    # End window at yesterday — today is in-progress and /sleep hasn't synced
+    end = date.today() - timedelta(days=1)
     start = end - timedelta(days=DAYS - 1)
     prev_end = start - timedelta(days=1)
     prev_start = prev_end - timedelta(days=DAYS - 1)
