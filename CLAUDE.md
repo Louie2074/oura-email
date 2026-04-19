@@ -1,11 +1,11 @@
 # oura-email
 
-Single-purpose script that pulls 7 days of Oura Ring data, renders a 6-panel matplotlib dashboard, and emails it via Gmail SMTP. Runs weekly in GitHub Actions; can also be invoked locally.
+Single-purpose script that pulls 7 days of Oura Ring data, renders a set of matplotlib charts (sleep, activity, stress, wellness), and emails them via Gmail SMTP. Runs weekly in GitHub Actions; can also be invoked locally.
 
 ## Files
 
 - `weekly_report.py` — the entire program. Keep it single-file; resist splitting into modules unless it grows past ~500 lines.
-- `requirements.txt` — `requests`, `matplotlib`, `python-dotenv`. No other deps.
+- `requirements.txt` — `requests`, `matplotlib`, `numpy`, `python-dotenv`. No other deps.
 - `.github/workflows/weekly-report.yml` — Mondays 13:00 UTC + manual `workflow_dispatch`.
 - `.env` — local secrets (gitignored). In CI, the same vars come from repo secrets.
 - `openapi-1.29.json` — Oura's OpenAPI spec, kept for reference. Grep this before guessing field names.
@@ -29,14 +29,15 @@ Use the **Personal Access Token** flow (`Authorization: Bearer $OURA_PAT`). The 
 - All daily endpoints accept `start_date` / `end_date` (YYYY-MM-DD).
 - `/daily_stress` does **not** have a `score` field. The numeric stress metric is `stress_high` (seconds in high-stress zone). The script charts this in minutes/day.
 - `/sleep` can return multiple sessions per day (e.g. naps); the script picks the longest by `total_sleep_duration`.
-- Resting HR comes from `/sleep.lowest_heart_rate` (matches what Oura's app shows). The `/heartrate` time-series endpoint is NOT used — averaging 24h BPM produces a misleading ~85–90 bpm figure for a healthy user because it includes workouts and stress spikes.
+- Resting HR comes from `/sleep.lowest_heart_rate` (matches what Oura's app shows). Do NOT compute resting HR from `/heartrate` time-series — averaging 24h BPM gives a misleading ~85–90 bpm figure because it includes workouts and stress spikes.
+- `/heartrate` IS used for the stress-by-hour heatmap. Each sample has a `source` in `{awake, rest, workout, sleep, live, session}`. The clock keeps `{awake, rest, live}` and computes excess BPM above the week's median resting HR, bucketed by local hour. `datetime.fromisoformat(sample["timestamp"])` yields a local-time-aware datetime via the offset in the string.
 - Pagination: responses include `next_token` when there's more data — `oura_get()` follows it automatically.
 
 ## Charting / email conventions
 
 - Always render exactly 7 days. Missing days stay as `None` in aggregation and render as `nan` (matplotlib leaves a gap) so the x-axis stays consistent.
-- One PNG **per chart** (7 total), each full-width at figsize=(10, 3.8), dpi=200. Do NOT go back to a single multi-subplot dashboard — it's unreadable on mobile.
-- Each chart is attached inline via a distinct `Content-ID` (`sleep_score`, `sleep_stages`, `activity_score`, `steps`, `calories`, `stress`, `resting_hr`).
+- One PNG **per chart** (currently 8), full-width at figsize=(10, 3.8) for line/bar charts (taller — up to 4.8 — for stacked/heatmap views), dpi=200. Do NOT go back to a single multi-subplot dashboard — it's unreadable on mobile.
+- Each chart is attached inline via a distinct `Content-ID` (`sleep_efficiency`, `sleep_stages`, `activity_minutes`, `steps`, `calories`, `stress_recovery`, `stress_clock`, `resting_hr`).
 - HTML layout uses tables (not flex/grid) with inline styles only — Gmail strips `<style>` blocks and doesn't honor flex/grid reliably.
 - Accent color palette lives in constants at the top of `weekly_report.py`. Keep matplotlib chart colors and HTML accent colors in sync.
 - Use `matplotlib.use("Agg")` at import time so the script works headless (CI has no display).

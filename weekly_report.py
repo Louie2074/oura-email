@@ -16,19 +16,22 @@ from __future__ import annotations
 import os
 import smtplib
 import sys
-from datetime import date, timedelta
+from collections import defaultdict
+from datetime import date, datetime, timedelta
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from io import BytesIO
-from statistics import mean
+from statistics import mean, median
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import requests
 from dotenv import load_dotenv
+from matplotlib.colors import LinearSegmentedColormap
 
 OURA_BASE = "https://api.ouraring.com/v2/usercollection"
 DAYS = 7
@@ -85,10 +88,16 @@ def oura_get(token: str, path: str, params: dict) -> list[dict]:
 
 def fetch_all(token: str, start: date, end: date) -> dict:
     dp = {"start_date": start.isoformat(), "end_date": end.isoformat()}
+    # /heartrate uses datetime and needs an inclusive right edge — pad by a day
+    hr_params = {
+        "start_datetime": f"{start.isoformat()}T00:00:00+00:00",
+        "end_datetime":   f"{(end + timedelta(days=1)).isoformat()}T00:00:00+00:00",
+    }
     return {
         "sleep":          oura_get(token, "/sleep", dp),
         "daily_activity": oura_get(token, "/daily_activity", dp),
         "daily_stress":   oura_get(token, "/daily_stress", dp),
+        "heartrate":      oura_get(token, "/heartrate", hr_params),
     }
 
 
@@ -135,6 +144,11 @@ def aggregate(raw: dict, days: list[date]) -> dict:
     stress_min   = sec_to_min(by_day(raw["daily_stress"], "stress_high"))
     recovery_min = sec_to_min(by_day(raw["daily_stress"], "recovery_high"))
 
+    # Time-of-day stress: excess BPM above baseline, bucketed by (day, hour-of-day)
+    rhr_vals = [v for v in resting_hr if v is not None]
+    baseline_hr = int(round(median(rhr_vals))) if rhr_vals else 65
+    stress_clock, stress_peaks = _stress_clock(raw.get("heartrate", []), days, baseline_hr)
+
     return {
         "labels":     [d.strftime("%a") for d in days],
         "sub_labels": [d.strftime("%-m/%-d") for d in days],
@@ -148,7 +162,51 @@ def aggregate(raw: dict, days: list[date]) -> dict:
         "calories": calories,
         "stress_min": stress_min,
         "recovery_min": recovery_min,
+        "stress_clock": stress_clock,
+        "stress_peaks": stress_peaks,
+        "baseline_hr": baseline_hr,
     }
+
+
+def _stress_clock(samples: list[dict], days: list[date], baseline: int):
+    """Bucket waking, non-workout HR samples into a 7×24 grid.
+
+    Each cell = max(0, mean(bpm) − baseline) for samples that fall in that
+    (day, hour) bucket. Empty cells are None. Returns (grid, top_peaks) where
+    top_peaks is a list of (row_index, hour, excess) sorted desc, capped at 3.
+    """
+    WAKING = {"awake", "rest", "live"}  # exclude sleep/workout/session
+    buckets: dict[tuple[str, int], list[int]] = defaultdict(list)
+    for s in samples:
+        if s.get("source") not in WAKING:
+            continue
+        ts_raw = s.get("timestamp")
+        bpm = s.get("bpm")
+        if not ts_raw or bpm is None:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_raw)
+        except ValueError:
+            continue
+        buckets[(ts.date().isoformat(), ts.hour)].append(bpm)
+
+    grid: list[list[float | None]] = []
+    peaks: list[tuple[int, int, float]] = []
+    for i, d in enumerate(days):
+        row: list[float | None] = []
+        key = d.isoformat()
+        for h in range(24):
+            vals = buckets.get((key, h))
+            if not vals:
+                row.append(None)
+                continue
+            excess = max(0.0, sum(vals) / len(vals) - baseline)
+            row.append(excess)
+            if excess > 0:
+                peaks.append((i, h, excess))
+        grid.append(row)
+    peaks.sort(key=lambda p: -p[2])
+    return grid, peaks[:3]
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +523,70 @@ def render_resting_hr(agg):
                        good_is_high=False)
 
 
+STRESS_CMAP = LinearSegmentedColormap.from_list(
+    "stress", ["#FFF1F2", "#FBCFE8", "#F9A8D4", "#EC4899", "#BE185D"])
+
+
+def render_stress_clock(agg):
+    """7×24 heatmap — day × hour-of-day, colored by excess BPM over resting."""
+    grid_raw = agg["stress_clock"]
+    if not grid_raw or not any(any(v is not None for v in row) for row in grid_raw):
+        # No heartrate data — render empty placeholder so the layout stays consistent
+        fig, ax = plt.subplots(figsize=(10, 3.5))
+        ax.text(0.5, 0.5, "No heart-rate samples available",
+                ha="center", va="center", color=SLATE_MUTED, fontsize=12,
+                transform=ax.transAxes)
+        ax.set_axis_off()
+        return _to_png(fig)
+
+    grid = np.array(
+        [[float("nan") if v is None else v for v in row] for row in grid_raw],
+        dtype=float,
+    )
+    masked = np.ma.masked_invalid(grid)
+    vmax = max(10.0, float(np.ma.max(masked)) if masked.count() else 10.0)
+
+    cmap = STRESS_CMAP.copy()
+    cmap.set_bad(color="#F1F5F9")  # slate-100 for no-wear/missing
+
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    im = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=0, vmax=vmax,
+                   interpolation="nearest")
+
+    # Cell borders for readability
+    ax.set_xticks(np.arange(-0.5, 24, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(agg["labels"]), 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=1.2)
+    ax.grid(which="major", visible=False)
+    ax.tick_params(which="minor", length=0)
+
+    ax.set_title(f"Stress Pattern by Hour  ·  baseline {agg['baseline_hr']} bpm")
+    ax.set_xticks(range(0, 24, 2))
+    ax.set_xticklabels([f"{h:02d}" for h in range(0, 24, 2)], fontsize=10)
+    ax.set_yticks(range(len(agg["labels"])))
+    ax.set_yticklabels([f"{d}  {s}" for d, s in zip(agg["labels"], agg["sub_labels"])],
+                        fontsize=10)
+    ax.set_xlabel("Hour of day (local)", color=SLATE_MUTED, fontsize=10)
+
+    # Circle + annotate top 3 peak hours
+    for row_i, hour, excess in agg["stress_peaks"]:
+        ax.scatter([hour], [row_i], s=180, facecolors="none",
+                   edgecolors=SLATE_TEXT, linewidths=1.8, zorder=5)
+        ax.annotate(f"+{excess:.0f}", (hour, row_i),
+                    textcoords="offset points", xytext=(0, -18),
+                    ha="center", fontsize=9, fontweight="bold",
+                    color=SLATE_TEXT,
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white",
+                              ec=SLATE_GRID, lw=0.8))
+
+    cbar = fig.colorbar(im, ax=ax, pad=0.015, fraction=0.03)
+    cbar.set_label("bpm over resting", color=SLATE_MUTED, fontsize=9)
+    cbar.ax.tick_params(colors=SLATE_MUTED, labelsize=9)
+    cbar.outline.set_visible(False)
+
+    return _to_png(fig)
+
+
 # ---------------------------------------------------------------------------
 # HTML email
 # ---------------------------------------------------------------------------
@@ -611,6 +733,13 @@ def _wellness_narrative(agg):
         parts.append(f"Resting HR averaged {sum(rhr)/len(rhr):.0f} bpm")
     if rec and stress:
         parts.append(f"{sum(rec)/len(rec):.0f} min recovery vs. {sum(stress)/len(stress):.0f} min high-stress per day")
+    peaks = agg.get("stress_peaks") or []
+    if peaks:
+        peak_strs = [
+            f"{agg['labels'][i]} {h:02d}:00 (+{ex:.0f} bpm)"
+            for i, h, ex in peaks
+        ]
+        parts.append(f"Peak stress hours: {', '.join(peak_strs)}")
     return ". ".join(parts) + "."
 
 
@@ -681,7 +810,7 @@ def build_html(this_wk, last_wk, start, end) -> str:
     wellness_html = _section(
         "Wellness", "Stress load and cardiovascular recovery",
         _wellness_narrative(this_wk), PINK,
-        ["stress_recovery", "resting_hr"])
+        ["stress_recovery", "stress_clock", "resting_hr"])
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -770,6 +899,7 @@ def main():
         "steps":            render_steps(this_wk),
         "calories":         render_calories(this_wk),
         "stress_recovery":  render_stress_recovery(this_wk),
+        "stress_clock":     render_stress_clock(this_wk),
         "resting_hr":       render_resting_hr(this_wk),
     }
 
